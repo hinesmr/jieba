@@ -15,8 +15,7 @@ import threading
 from functools import wraps
 import logging
 from hashlib import md5
-from sqlalchemy import MetaData, create_engine, Table, Integer, String, Column, Float
-from sqlalchemy.interfaces import PoolListener
+import sqlite3
 
 DICTIONARY = "dict.txt"
 DICT_LOCK = threading.RLock()
@@ -32,12 +31,6 @@ log_console = logging.StreamHandler(sys.stderr)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 logger.addHandler(log_console)
-
-class JiebaListener(PoolListener):
-    def connect(self, dbapi_con, con_record):
-        dbapi_con.execute('pragma journal_mode=OFF')
-        dbapi_con.execute('PRAGMA synchronous=OFF')
-        #dbapi_con.execute('PRAGMA cache_size=100000')
 
 def setLogLevel(log_level):
     global logger
@@ -66,17 +59,17 @@ def gen_pfdict(f_name):
 
 def init_sqlite(cache_file) :
     global use_sqlite
-    db = create_engine('sqlite:///' + cache_file, listeners = [JiebaListener()])
-    db.echo = False
-    metadata = MetaData(db)
-    conn = db.connect()
-    use_sqlite = {"conn" : conn}
-    use_sqlite["pfdict"] = Table('pfdict', metadata, Column('word', String, index=True))
-    use_sqlite["FREQ"] = Table('FREQ', metadata, Column('word', String, index = True), Column('freq', Float, index = True))
-    use_sqlite["pfdict"].create(checkfirst=True)
-    use_sqlite["FREQ"].create(checkfirst=True)
+    db = sqlite3.connect(cache_file)
+    conn = db.cursor()
+    conn.execute('pragma journal_mode=OFF')
+    conn.execute('PRAGMA synchronous=OFF')
+    use_sqlite = {"conn" : conn, "db" : db}
+    conn.execute("create table if not exists pfdict (word text)")
+    conn.execute("create index if not exists pfdict_index on pfdict (word)")
+    conn.execute("create table if not exists FREQ (word text, freq real)")
+    conn.execute("create index if not exists FREQ_index on FREQ (word)")
 
-# 'sqlite' can be True or '/path/to/jieba.db' as cache
+# 'sqlite' can be True or '/path/to/jieba{hash}.db' as cache
 # if True, then use /tmp as usual
 def initialize(dictionary=None, sqlite = False):
     global pfdict, FREQ, total, min_freq, initialized, DICTIONARY, DICT_LOCK, use_sqlite
@@ -105,7 +98,7 @@ def initialize(dictionary=None, sqlite = False):
             if isinstance(sqlite, str) :
                 cache_file = sqlite
             else :
-                cache_file = os.path.join(tempfile.gettempdir(), "jieba.db")
+                cache_file = os.path.join(tempfile.gettempdir(), "jieba.u%s.db" % md5(abs_path.encode('utf-8', 'replace')).hexdigest())
 
             init_sqlite(cache_file)
 
@@ -115,19 +108,16 @@ def initialize(dictionary=None, sqlite = False):
                 try:
                     with open(cache_file, 'rb') as cf:
                         pfdict,FREQ,total,min_freq = marshal.load(cf)
-                    print "Examples pfdict len: " + len(pfdict) + " first: " + pfdict.iteritems()[0][0]
                     # prevent conflict with old version
                     load_from_cache_fail = not isinstance(pfdict, set)
                 except:
                     load_from_cache_fail = True
             else :
-                s = use_sqlite["FREQ"].select().where(use_sqlite["FREQ"].c.word == u"total")
-                rs = s.execute()
+                rs = use_sqlite["conn"].execute("select * from FREQ where word = 'total'")
                 result = rs.fetchone()
                 if result is not None :
                     total = result[1]
-                    s = use_sqlite["FREQ"].select().where(use_sqlite["FREQ"].c.word == u"min_freq")
-                    rs = s.execute()
+                    rs = use_sqlite["conn"].execute("select * from FREQ where word = 'min_freq'")
                     result = rs.fetchone()
                     if result is not None :
                         min_freq = result[1]
@@ -156,20 +146,16 @@ def initialize(dictionary=None, sqlite = False):
                 except:
                     logger.exception("Dump cache file failed.")
             else :
-                trans = use_sqlite["conn"].begin()
+                use_sqlite["db"].isolation_level = None
+                use_sqlite["conn"].execute("begin")
                 for x in pfdict :
-                    i = use_sqlite["pfdict"].insert().values(word = x)
-                    use_sqlite["conn"].execute(i)
+                    use_sqlite["conn"].execute("insert into pfdict values ('%s')" % x)
                 for y in FREQ :
-                    i = use_sqlite["FREQ"].insert().values(word = y, freq = FREQ[y])
-                    use_sqlite["conn"].execute(i)
+                    use_sqlite["conn"].execute("insert into FREQ values ('%s', %s)" % (y, FREQ[y]))
 
-                i = use_sqlite["FREQ"].insert().values(word = "total", freq = total)
-                use_sqlite["conn"].execute(i)
-                i = use_sqlite["FREQ"].insert().values(word = "min_freq", freq = min_freq)
-                use_sqlite["conn"].execute(i)
-                
-                trans.commit()
+                use_sqlite["conn"].execute("insert into FREQ values ('total', %s)" % total)
+                use_sqlite["conn"].execute("insert into FREQ values ('min_freq', %s)" % min_freq)
+                use_sqlite["conn"].execute("commit")
 
         initialized = True
 
@@ -215,7 +201,7 @@ def in_FREQ(word) :
     if not use_sqlite :
         return FREQ[word] if word in FREQ else False
     else :
-        result = use_sqlite["FREQ"].select().where(use_sqlite["FREQ"].c.word == word).execute().fetchone()
+        result = use_sqlite["conn"].execute("select * from FREQ where word = '" + word + "'").fetchone()
         return result[1] if result is not None else False
 
 @require_initialized
@@ -232,7 +218,7 @@ def get_DAG(sentence):
                 if frag not in pfdict:
                     break
             else :
-                result = use_sqlite["pfdict"].select().where(use_sqlite["pfdict"].c.word == frag).execute().fetchone()
+                result = use_sqlite["conn"].execute("select * from pfdict where word = '" + frag + "'").fetchone()
                 if result is None :
                     break
 
@@ -404,8 +390,9 @@ def add_word(word, freq, tag=None):
     if not use_sqlite :
         FREQ[word] = f 
     else :
-        i = use_sqlite["FREQ"].insert().values(word = word, freq = f)
-        use_sqlite["conn"].execute(i)
+        #i = use_sqlite["FREQ"].insert().values(word = word, freq = f)
+        #use_sqlite["conn"].execute(i)
+        use_sqlite["conn"].execute("insert into FREQ values ('%s', %s)" % (word, f))
 
     if tag is not None:
         user_word_tag_tab[word] = tag.strip()
